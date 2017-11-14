@@ -1,0 +1,135 @@
+---
+title: "Project"
+author: "Jacob Aronoff"
+date: "11/12/2017"
+output: pdf_document
+---
+
+
+```{r setup, include=FALSE}
+# install.packages('devtools') 
+# devtools::install_github("rstats-db/bigrquery")
+library("bigrquery")
+library("dplyr")
+# devtools::install_github("hrbrmstr/omdbapi")
+library("omdbapi")
+project <- "redditcollaborativefiltering" # put your project ID here
+
+if(exists("wordsNotToUse", inherits = T)) {
+    # Pass
+  } else {
+    wordsNotToUse = scan("stopWords.txt", what="", sep="\n")
+  }
+if(exists("movies", inherits = T)) {
+    # Pass
+  } else {
+    movies = scan("initialMovies.txt", what="", sep="\n")
+  }
+
+```
+
+``` {r queries, include=FALSE}
+allMoviePostQuery <- function(x)
+{
+  constraint <- "title IS NOT NULL AND("
+  orPresent = ""
+  for(movie in x)
+  {
+    constraint = paste(constraint, paste(orPresent, " title CONTAINS ","\"",movie,"\" ", sep=""), sep = "")
+    orPresent = "or"
+  }
+  return(paste("SELECT
+               title, score, subreddit, created_utc, num_comments, author, url
+               FROM
+               TABLE_QUERY([fh-bigquery:reddit_posts], \"REGEXP_MATCH(table_id, '^201._..$')\")
+               WHERE
+              ", constraint, ")
+               GROUP BY
+               subreddit, score, title, created_utc, num_comments, author, url
+               ORDER BY
+               score DESC
+               LIMIT 300;", sep = ""))
+}
+moviePostQuery <- function(movie)
+{
+  return(paste("SELECT
+               created_utc, subreddit, author, domain, num_comments, score, ups, downs, title, selftext, id, gilded
+               FROM
+               TABLE_QUERY([fh-bigquery:reddit_posts], \"REGEXP_MATCH(table_id, '^201._..$')\")
+               WHERE
+               title CONTAINS \"", movie["movie"], "\"
+               and
+               created_utc < ", as.numeric(movie["date"]), "
+               ORDER BY
+               score DESC;", sep = ""))
+}
+getMovieData <- function(x)
+{
+  toReturn = data.frame(movie=character(0), date=as.POSIXct(character()), boxOffice=numeric(0), imdb=numeric(0), meta=numeric(0), stringsAsFactors=FALSE)
+  for(movie in x)
+  {
+    print(paste("Getting data for",movie))
+    content <- find_by_title(movie, year_of_release=2016)
+    imdb = eval(content$imdbRating[1])
+    meta = as.numeric(content$Metascore[1])/10
+    dateString <- as.POSIXct(content$Released[1], format="%Y-%m-%d")
+    
+    r = list(movie=movie, date=dateString, boxOffice=content$BoxOffice[1], imdb=imdb, meta=meta)
+    
+    toReturn[nrow(toReturn)+1,] = r
+  }
+  toReturn$boxOffice <- as.numeric(gsub('[$,]', '', toReturn$boxOffice))
+  return(toReturn)
+}
+```
+
+### Getting the data
+
+
+I decided to get started with my project by only looking about posts relating to a movie, later in the project I want to get into comments and sentiment analysis.
+
+In constructing the query, I ran into a couple of problems.
+
+``` {r getData}
+if(exists("movieData", inherits = T)) {
+    # Pass
+  } else {
+    movieData = getMovieData(movies)
+  }
+movieQueries = list()
+for(i in 1:nrow(movieData))
+{
+  movieQueries <- append(movieQueries, moviePostQuery(movieData[i,]))
+}
+
+if(exists("bigQueryData", inherits = T)) {
+    # Pass
+  } else {
+    bigQueryData <- data.frame(created_utc=numeric(0),
+                               subreddit=character(0),
+                               author=character(0),
+                               domain=character(0),
+                               num_comments=numeric(0),
+                               score=numeric(0),
+                               ups=numeric(0),
+                               downs=numeric(0),
+                               title=character(0),
+                               selftext=character(0),
+                               id=character(0),
+                               gilded=numeric(0),
+                               movie=character(0),
+                               stringsAsFactors=FALSE)
+    for(i in 1:length(movieQueries))
+    {
+      post.data <- query_exec(movieQueries[[i]][1], project = project, useLegacySql = FALSE, max_pages = Inf)
+      post.data$movie = movieData[i,]$movie
+      print(paste("The response has",nrow(post.data), "rows"))
+      for(x in 1:nrow(post.data))
+      {
+        bigQueryData[nrow(bigQueryData)+1,] = post.data[x,]
+      }
+    }
+  }
+write.csv(bigQueryData, file = "bigQueryData.csv", na="NA")
+# 
+```
