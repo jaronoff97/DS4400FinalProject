@@ -1,0 +1,485 @@
+---
+title: "Project"
+author: "Jacob Aronoff"
+date: "11/12/2017"
+output: pdf_document
+---
+
+
+```{r setup, include=FALSE}
+# install.packages('devtools') 
+# devtools::install_github("rstats-db/bigrquery")
+library("bigrquery")
+library("dplyr")
+library("dataQualityR")
+# devtools::install_github("hrbrmstr/omdbapi")
+library("omdbapi")
+library("TMDb")
+library("ggplot2")
+library("e1071")
+library("randomForest")
+library("sentimentr")
+project <- "redditcollaborativefiltering" # put your project ID here
+tmdb.api.key <- "36601b895cdac647823c9168a2fedadc"
+if(exists("wordsNotToUse", inherits = T)) {
+    # Pass
+  } else {
+    wordsNotToUse = scan("stopWords.txt", what="", sep="\n")
+  }
+if(exists("movies", inherits = T)) {
+    # Pass
+  } else {
+    movies = scan("initialMovies.txt", what="", sep="\n")
+  }
+if(exists("testMovies", inherits = T)) {
+    # Pass
+  } else {
+    testMovies = scan("testMovies.txt", what="", sep="\n")
+  }
+
+```
+
+### Make the queries
+
+
+``` {r queries, include=FALSE}
+# THIS FUNCTION IS USELESS KEPT IN TO SHOW PROGRESS
+allMoviePostQuery <- function(x)
+{
+  constraint <- "title IS NOT NULL AND("
+  orPresent = ""
+  for(movie in x)
+  {
+    constraint = paste(constraint, paste(orPresent, " title CONTAINS ","\"",movie,"\" ", sep=""), sep = "")
+    orPresent = "or"
+  }
+  return(paste("SELECT
+               title, score, subreddit, created_utc, num_comments, author, url
+               FROM
+               TABLE_QUERY([fh-bigquery:reddit_posts], \"REGEXP_MATCH(table_id, '^201._..$')\")
+               WHERE
+              ", constraint, ")
+               GROUP BY
+               subreddit, score, title, created_utc, num_comments, author, url
+               ORDER BY
+               score DESC
+               LIMIT 300;", sep = ""))
+}
+moviePostQuery <- function(movie)
+{
+  return(paste("SELECT
+               created_utc, subreddit, author, domain, num_comments, score, ups, downs, title, selftext, id, gilded
+               FROM
+               TABLE_QUERY([fh-bigquery:reddit_posts], \"REGEXP_MATCH(table_id, '^201._..$')\")
+               WHERE
+               title CONTAINS \"", movie["movie"], "\"
+               and
+               created_utc < ", as.numeric(movie["date"]), "
+               ORDER BY
+               score DESC;", sep = ""))
+}
+getMovieData <- function(x)
+{
+  toReturn = data.frame(movie=character(0), date=as.POSIXct(character()), budget=numeric(0), revenue=numeric(0), imdb=numeric(0), meta=numeric(0), stringsAsFactors=FALSE)
+  requests <- 0
+  for(movie in x)
+  {
+    print(paste("Getting data for",movie))
+    movieSearch <- search_movie(api_key = tmdb.api.key, movie)
+    curMovie <- movie(tmdb.api.key, movieSearch$results$id[1])
+    content <- find_by_title(movie, year_of_release=as.numeric(substring(curMovie$release_date,1,4)))
+    requests = requests + 2
+    print(requests)
+    if(requests >= 20)
+    {
+      requests = 0
+      Sys.sleep(10)
+    }
+    budget <- curMovie$budget
+    revenue <- curMovie$revenue
+    imdb = eval(content$imdbRating[1])
+    meta = as.numeric(content$Metascore[1])/10
+    dateString <- as.POSIXct(content$Released[1], format="%Y-%m-%d")
+    
+    r = list(movie=movie, date=dateString, budget=budget, revenue=revenue, imdb=imdb, meta=meta)
+    
+    toReturn[nrow(toReturn)+1,] = r
+  }
+  
+  return(toReturn)
+}
+getAllData <- function(variableToStore, queries, mov.data) {
+  fileName <- paste(variableToStore,".csv",sep = "")
+  if(exists(variableToStore, inherits = T)) {
+    # Pass
+} else if(file.exists(fileName)) {
+    assign(variableToStore, read.csv(fileName, header = TRUE), envir = .GlobalEnv)
+    assign(class(get(variableToStore)$created_utc), class(Sys.time()), envir = .GlobalEnv)
+  } else {
+    temp <- data.frame(created_utc=numeric(0),
+                               subreddit=character(0),
+                               author=character(0),
+                               domain=character(0),
+                               num_comments=numeric(0),
+                               score=numeric(0),
+                               ups=numeric(0),
+                               downs=numeric(0),
+                               title=character(0),
+                               selftext=character(0),
+                               id=character(0),
+                               gilded=numeric(0),
+                               movie=character(0),
+                               budget=numeric(0),
+                               revenue=numeric(0),
+                               margin=numeric(0),
+                               stringsAsFactors=FALSE)
+    for(i in 1:length(queries))
+    {
+      post.data <- query_exec(queries[[i]][1], project = project, useLegacySql = FALSE, max_pages = Inf)
+      post.data$movie = mov.data[i,]$movie
+      post.data$budget = mov.data[i,]$budget
+      post.data$revenue = mov.data[i,]$revenue
+      post.data$margin = 100 * (mov.data[i,]$revenue - mov.data[i,]$budget) / mov.data[i,]$revenue
+      print(paste("The response has",nrow(post.data), "rows"))
+      for(x in 1:nrow(post.data))
+      {
+        temp[nrow(temp)+1,] = post.data[x,]
+      }
+    }
+    
+    write.csv(temp, file = fileName, na="NA")
+    assign(variableToStore, temp, envir = .GlobalEnv)
+  }
+}
+```
+
+### Getting the data
+
+
+I decided to get started with my project by only looking about posts relating to a movie, later in the project I want to get into comments and sentiment analysis.
+
+In constructing the query, I ran into a couple of problems. At first the query I was trying to run was returning all NULL values, I then changed the query from doing it all at once, to doing the queries individually. Making this change also allowed me to make it so that each query would only get data up until the movie's release date. 
+
+``` {r getData}
+if(exists("movieData", inherits = T)) {
+    # Pass
+  } else {
+    movieData = getMovieData(movies)
+  }
+movieQueries = list()
+for(i in 1:nrow(movieData))
+{
+  movieQueries <- append(movieQueries, moviePostQuery(movieData[i,]))
+}
+
+getAllData("bigQueryData", movieQueries)
+```
+
+## Creating an Analytics Base Table
+
+``` {r analyticsBaseTable}
+checkDataQuality(data= bigQueryData, out.file.num="dq_num.csv", out.file.cat= "dq_cat.csv")
+
+numericalQuality <- read.csv("dq_num.csv", header = TRUE)
+categoricalQuality <- read.csv("dq_cat.csv", header = TRUE)
+
+print(numericalQuality)
+print(categoricalQuality)
+```
+
+
+## Exploring Data
+
+In exploring my data I wanted to just look at basic patterns in the data, and it looks like there are some general trends in a few of the fields. I'll be able to do some better analysis later, when I implement Plotly so I can easily change around the data.
+
+``` {r exploreData }
+for(movie in movies)
+{
+  p <- ggplot(bigQueryData[bigQueryData$movie == movie,], aes(x = created_utc, y = num_comments)) + geom_line() + ggtitle(movie)  
+  print(p)
+}
+```
+
+## Techniques to be used in predictions
+
+
+I believe the two best techniques to be used for my predictions is going to be either a random forest or using a naive bayesian model. It also may be useful to use a classification algorithm to simplify my problem; rather than trying to predict an exact box office outcome, I could also try and predict whether the movie is a flop, breakeven, or hit. Breaking it up into a categorical variable would allow me to use a support vector machine.
+
+
+### Get the test data
+
+I wanted to test my model with the following five movies
+
+*Arrival
+*Moonlight
+*La La Land
+*Bad Santa 2
+*Allegiant
+
+The first three movies are "hits"
+The last two movies are "flops"
+
+``` {r getTrainData}
+if(exists("movieTestData", inherits = T)) {
+    # Pass
+  } else {
+    movieTestData = getMovieData(testMovies)
+  }
+movieTestQueries = list()
+for(i in 1:nrow(movieTestData))
+{
+  movieTestQueries <- append(movieTestQueries, moviePostQuery(movieTestData[i,]))
+}
+getAllData("bigQueryTestData", movieTestQueries)
+bigQueryTestData = bigQueryTestData[complete.cases(bigQueryTestData), ]
+```
+
+### Predictions
+
+I wanted to start by trying to predict using an SVM classifier. I'm going to try using two different kernels, radial and linear.
+
+``` {r PredictSVM}
+# levels(bigQueryData$subreddit) = subs
+# bigQueryTestData$subreddit <- as.factor(bigQueryTestData$subreddit)
+# levels(bigQueryTestData$subreddit) = subs
+usefulData <- bigQueryData[,c("subreddit", "num_comments", "score", "gilded", "margin")]
+usefulData$IsFlop <- as.factor(ifelse(usefulData$margin < 65, 1, 0))
+testData <- bigQueryTestData[,c("subreddit", "num_comments", "score", "gilded", "margin", "movie")]
+testData$IsFlop <- as.factor(ifelse(testData$margin < 65, 1, 0))
+subs <- union(unique(bigQueryData$subreddit), unique(bigQueryTestData$subreddit))
+levels(testData$subreddit) = subs
+levels(usefulData$subreddit) = subs
+
+if(exists("svm_model", inherits = T)) {
+    # Pass
+  } else {
+    svm_model <- svm(IsFlop ~ . - margin, data=usefulData, kernel = 'linear')
+  }
+# for(movie in unique(movieTestData$movie))
+# {
+#   p <- predict(svm_model, testData[testData$movie==movie,1:5])
+#   pTable <- table(p)
+#   percentChanceFlop <- pTable["1"] / (pTable["1"]+pTable["0"])
+#   print(paste("The percent chance", movie, "is a flop:",percentChanceFlop))
+#   isFlopText <- ifelse(bigQueryTestData[bigQueryTestData$movie==movie,]$margin[1] < 65, "is", "is not")
+#   print(paste("The movie", movie, isFlopText,"a flop"))
+# }
+
+prediction <- predict(svm_model, testData[,1:5])
+power <- nrow(testData[prediction == testData$IsFlop,]) / nrow(testData)
+print(power)
+rm(usefulData)
+rm(testData)
+```
+
+I found that SVM is really not useful in this case, for most cases the prediction was just incredibly incorrect. My next mode of predicting is going to be through a random forest combined with sentiment analysis. 
+
+### Sentiment Analysis
+``` {r sentimentForest}
+
+if(exists("usefulData", inherits = T)) {
+    # Pass
+  } else {
+    usefulData <- bigQueryData[,c("subreddit", "num_comments", "score", "gilded", "margin", "title", "movie")]
+    usefulData$IsFlop <- as.factor(ifelse(usefulData$margin < 65, 1, 0))
+    usefulData$titleSentiment <- usefulData$title %>% as.character() %>% get_sentences() %>% sentiment_by() %>% last()
+  }
+if(exists("testData", inherits = T)) {
+    # Pass
+  } else {
+    testData <- bigQueryTestData[,c("subreddit", "num_comments", "score", "gilded", "margin", "movie", "title")]
+    testData$IsFlop <- as.factor(ifelse(testData$margin < 65, 1, 0))
+    testData$titleSentiment <- testData$title %>% as.character() %>% get_sentences() %>% sentiment_by() %>% last()
+  }
+if(exists("forestClassPred", inherits = T)) {
+    # Pass
+  } else {
+    forestClassPred <- randomForest::randomForest(IsFlop ~ . - margin - title - subreddit - movie, data=usefulData, method="class", na.action=na.exclude)
+  }
+
+prediction <- predict(forestClassPred, testData)
+power <- nrow(testData[prediction == testData$IsFlop,]) / nrow(testData)
+print(power)
+rm(usefulData)
+rm(testData)
+```
+
+### Using Naive Bayes
+
+``` {r naiveBayes}
+if(exists("usefulData", inherits = T)) {
+    # Pass
+  } else {
+    usefulData <- bigQueryData[,c("subreddit", "num_comments", "score", "gilded", "margin", "title", "movie")]
+    usefulData$IsFlop <- as.factor(ifelse(usefulData$margin < 65, 1, 0))
+    usefulData$titleSentiment <- usefulData$title %>% as.character() %>% get_sentences() %>% sentiment_by() %>% last()
+  }
+if(exists("testData", inherits = T)) {
+    # Pass
+  } else {
+    testData <- bigQueryTestData[,c("subreddit", "num_comments", "score", "gilded", "margin", "movie", "title")]
+    testData$IsFlop <- as.factor(ifelse(testData$margin < 65, 1, 0))
+    testData$titleSentiment <- testData$title %>% as.character() %>% get_sentences() %>% sentiment_by() %>% last()
+  }
+if(exists("naivePred", inherits = T)) {
+    # Pass
+  } else {
+    naivePred <- naiveBayes(IsFlop ~ titleSentiment + score, data=usefulData, na.action=na.exclude)
+  }
+
+prediction <- predict(naivePred, testData)
+power <- nrow(testData[prediction == testData$IsFlop,]) / nrow(testData)
+print(power)
+rm(usefulData)
+rm(testData)
+```
+
+### SVM with Sentiment Analysis
+
+``` {r svmSentiment}
+if(exists("usefulData", inherits = T)) {
+    # Pass
+  } else {
+    usefulData <- bigQueryData[,c("subreddit", "num_comments", "score", "gilded", "margin", "title", "movie")]
+    usefulData$IsFlop <- as.factor(ifelse(usefulData$margin < 65, 1, 0))
+    usefulData$titleSentiment <- usefulData$title %>% as.character() %>% get_sentences() %>% sentiment_by() %>% last()
+  }
+if(exists("testData", inherits = T)) {
+    # Pass
+  } else {
+    testData <- bigQueryTestData[,c("subreddit", "num_comments", "score", "gilded", "margin", "movie", "title")]
+    testData$IsFlop <- as.factor(ifelse(testData$margin < 65, 1, 0))
+    testData$titleSentiment <- testData$title %>% as.character() %>% get_sentences() %>% sentiment_by() %>% last()
+  }
+if(exists("svm_sentiment_model", inherits = T)) {
+    # Pass
+  } else {
+    svm_sentiment_model <- svm(IsFlop ~ titleSentiment + score + num_comments, data=usefulData, kernel = 'radial')
+    # svm_sentiment_model.1 <- svm(IsFlop ~ titleSentiment + score + num_comments, data=usefulData, kernel = 'polynomial')
+    # svm_sentiment_model.2 <- svm(IsFlop ~ titleSentiment + score + num_comments, data=usefulData, kernel = 'sigmoid')
+  }
+
+prediction <- predict(svm_sentiment_model, testData)
+power <- nrow(testData[prediction == testData$IsFlop,]) / nrow(testData)
+print(power)
+rm(usefulData)
+rm(testData)
+```
+
+### Linear Regression
+
+``` {r linearRegression}
+goodModel <- function(predColumn, df) {
+	initialColumnNames = ""
+	for (name in names(df[,!(names(df) %in% c(predColumn))])) {
+		initialColumnNames=paste(initialColumnNames,name,"+")
+	}
+	initialColumnNames = substr(initialColumnNames, 0, nchar(initialColumnNames)-2)
+	newFormula = paste(predColumn,"~",initialColumnNames)
+	print(newFormula)
+	pred <- lm(newFormula, data=df)
+	maxValue = max(summary(pred)$coefficients[,4] )
+	while(maxValue>0.05 ){
+		newFormula = paste(predColumn,"~")
+		for (name in names(summary(pred)$coefficients[,4])) {
+			if(summary(pred)$coefficients[,4][[name]]!=maxValue & name!="(Intercept)"){
+				newFormula = paste(newFormula,name,"+")
+			} else if (name!="(Intercept)") {
+				print(paste("The",name,"column was dropped, p value:",maxValue))
+			}
+		}
+		newFormula = substr(newFormula, 0, nchar(newFormula)-2)
+		pred <- lm(newFormula, data=df)
+		maxValue = max(summary(pred)$coefficients[,4] )
+
+		if(summary(pred)$coefficients[,4][["(Intercept)"]]==maxValue){
+			break
+		}
+	}
+	return(pred)
+}
+
+if(exists("usefulData", inherits = T)) {
+    # Pass
+  } else {
+    usefulData <- bigQueryData[,c("subreddit", "num_comments", "score", "gilded", "margin", "title", "movie")]
+    usefulData$titleSentiment <- usefulData$title %>% as.character() %>% get_sentences() %>% sentiment_by() %>% last()
+    usefulData$IsFlop <- ifelse(usefulData$margin < 65, 1, 0)
+  }
+if(exists("testData", inherits = T)) {
+    # Pass
+  } else {
+    testData <- bigQueryTestData[,c("subreddit", "num_comments", "score", "gilded", "margin", "movie", "title")]
+    testData$titleSentiment <- testData$title %>% as.character() %>% get_sentences() %>% sentiment_by() %>% last()
+    testData$IsFlop <- as.factor(ifelse(testData$margin < 65, 1, 0))
+  }
+s = c(2,3,4,5,8)
+model <- goodModel("margin", usefulData[,s])
+prediction <- predict(model, testData)
+prediction <- as.factor(ifelse(prediction < 65, 1, 0))
+power <- nrow(testData[prediction == testData$IsFlop,]) / nrow(testData)
+print(power)
+
+# rm(usefulData)
+# rm(testData)
+```
+
+``` {r graphsForPres}
+margin.vs.num_comments <- ggplot(bigQueryData, aes(x=num_comments, y=margin)) + geom_point(size=2, shape=23)
+margin.vs.score <- ggplot(bigQueryData, aes(x=score, y=margin)) + geom_point(size=2, shape=23)
+print(margin.vs.num_comments)
+print(margin.vs.score)
+margin.for.movie <- ggplot(bigQueryData, aes(x=movie, y=margin)) + geom_bar(stat = "identity") + theme(axis.text.x = element_text(angle = 90, hjust = 1)) + ggtitle("Movie Margin")
+print(margin.for.movie)
+usefulData <- bigQueryData[,c("subreddit", "num_comments", "score", "gilded", "margin", "title", "movie")]
+usefulData$titleSentiment <- usefulData$title %>% as.character() %>% get_sentences() %>% sentiment_by() %>% last()
+usefulData$IsFlop <- ifelse(usefulData$margin < 65, 1, 0)
+flop.vs.sentiment <- ggplot(usefulData, aes(x=titleSentiment, y=IsFlop)) + geom_point(size=2, shape=23)
+print(flop.vs.sentiment)
+svm.plot <- plot(svm_sentiment_model, usefulData, IsFlop ~ num_comments)
+print(svm.plot)
+comments.vs.score <- ggplot(usefulData, aes(x=num_comments, y=score,color=movie,shape=as.factor(IsFlop))) + geom_point(size=2)
+print(comments.vs.score)
+sentiment.vs.margin <- ggplot(usefulData, aes(x=titleSentiment, y=margin,color=movie,shape=as.factor(IsFlop))) + geom_point(size=2)
+print(sentiment.vs.margin)
+```
+
+
+
+
+### Just a test for a single new movie
+``` {r testIsolatedExample}
+getPredictionForMovie <- function(movie.name, clean.run=F, remove.after=F){
+if (clean.run)
+{
+  # if(exists("single.movie.data")) 
+  if(file.exists("single.movie.bigquery.data.csv")){
+    file.remove("single.movie.bigquery.data.csv")
+  }
+}
+single.movie.names <- c("Spider-Man: Homecoming")
+if(exists("single.movie.data", inherits = T)) {
+    # Pass
+  } else {
+    single.movie.data = getMovieData(single.movie.names)
+  }
+single.movie.queries = list()
+for(i in 1:nrow(single.movie.data))
+{
+  single.movie.queries <- append(single.movie.queries, moviePostQuery(single.movie.data[i,]))
+}
+getAllData("single.movie.bigquery.data", single.movie.queries, single.movie.data)
+single.movie.bigquery.data = single.movie.bigquery.data[complete.cases(single.movie.bigquery.data), ]
+single.movie.bigquery.data$titleSentiment <- single.movie.bigquery.data$title %>% as.character() %>% get_sentences() %>% sentiment_by() %>% last()
+single.movie.bigquery.data$IsFlop <- as.factor(ifelse(single.movie.bigquery.data$margin < 65, 1, 0))
+levels(single.movie.bigquery.data$IsFlop) <- c(0, 1)
+prediction <- predict(svm_sentiment_model, single.movie.bigquery.data)
+power <- nrow(single.movie.bigquery.data[prediction == single.movie.bigquery.data$IsFlop,]) / nrow(single.movie.bigquery.data)
+print(power)
+}
+
+```
+
+
+
+

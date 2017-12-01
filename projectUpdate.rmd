@@ -11,8 +11,11 @@ output: pdf_document
 # devtools::install_github("rstats-db/bigrquery")
 library("bigrquery")
 library("dplyr")
+library("dataQualityR")
 # devtools::install_github("hrbrmstr/omdbapi")
 library("omdbapi")
+library("ggplot2")
+library("randomForest")
 project <- "redditcollaborativefiltering" # put your project ID here
 
 if(exists("wordsNotToUse", inherits = T)) {
@@ -28,7 +31,11 @@ if(exists("movies", inherits = T)) {
 
 ```
 
+### Make the queries
+
+
 ``` {r queries, include=FALSE}
+# THIS FUNCTION IS USELESS KEPT IN TO SHOW PROGRESS
 allMoviePostQuery <- function(x)
 {
   constraint <- "title IS NOT NULL AND("
@@ -88,7 +95,7 @@ getMovieData <- function(x)
 
 I decided to get started with my project by only looking about posts relating to a movie, later in the project I want to get into comments and sentiment analysis.
 
-In constructing the query, I ran into a couple of problems.
+In constructing the query, I ran into a couple of problems. At first the query I was trying to run was returning all NULL values, I then changed the query from doing it all at once, to doing the queries individually. Making this change also allowed me to make it so that each query would only get data up until the movie's release date. 
 
 ``` {r getData}
 if(exists("movieData", inherits = T)) {
@@ -104,6 +111,9 @@ for(i in 1:nrow(movieData))
 
 if(exists("bigQueryData", inherits = T)) {
     # Pass
+} else if(file.exists("bigQueryData.csv")) {
+    bigQueryData <- read.csv("bigQueryData.csv", header = TRUE)
+    class(bigQueryData$created_utc) <- class(Sys.time())
   } else {
     bigQueryData <- data.frame(created_utc=numeric(0),
                                subreddit=character(0),
@@ -129,7 +139,37 @@ if(exists("bigQueryData", inherits = T)) {
         bigQueryData[nrow(bigQueryData)+1,] = post.data[x,]
       }
     }
+    write.csv(bigQueryData, file = "bigQueryData.csv", na="NA")
   }
-write.csv(bigQueryData, file = "bigQueryData.csv", na="NA")
-# 
+
 ```
+
+## Creating an Analytics Base Table
+
+``` {r analyticsBaseTable}
+checkDataQuality(data= bigQueryData, out.file.num="dq_num.csv", out.file.cat= "dq_cat.csv")
+
+numericalQuality <- read.csv("dq_num.csv", header = TRUE)
+categoricalQuality <- read.csv("dq_cat.csv", header = TRUE)
+
+print(numericalQuality)
+print(categoricalQuality)
+```
+
+
+## Exploring Data
+
+In exploring my data I wanted to just look at basic patterns in the data, and it looks like there are some general trends in a few of the fields. I'll be able to do some better analysis later, when I implement Plotly so I can easily change around the data.
+
+``` {r exploreData}
+for(movie in movies)
+{
+  p <- ggplot(bigQueryData[bigQueryData$movie == movie,], aes(x = created_utc, y = num_comments)) + geom_line() + ggtitle(movie)  
+  print(p)
+}
+```
+
+## Techniques to be used in predictions
+
+
+I believe the two best techniques to be used for my predictions is going to be either a random forest or using a naive bayesian model. It also may be useful to use a classification algorithm to simplify my problem; rather than trying to predict an exact box office outcome, I could also try and predict whether the movie is a flop, breakeven, or hit. Breaking it up into a categorical variable would allow me to use a support vector machine.
